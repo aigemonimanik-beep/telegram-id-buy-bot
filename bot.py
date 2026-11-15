@@ -23,7 +23,10 @@ How it works (Bengali UI, persistent reply keyboard):
   Sellers (home page buttons, always visible):
     Sell IDs       - pick an ACTIVE category, then send a CSV/.xlsx file
                      or paste lines (user | password); one submission
-                     (SUB-1001, ...) is created and waits for review
+                     (SUB-1001, ...) is created and waits for review.
+                     The receipt counts the sheet's rows serially in
+                     column A and flags any username that appears twice
+                     as a duplicate (only the first copy is taken in).
     My balance     - balance, total earned, total IDs sold, good/bad
     My submissions - their submissions with status + good/bad counts
     Rules          - rules text set by the admin
@@ -38,7 +41,9 @@ How it works (Bengali UI, persistent reply keyboard):
     View pending   - pending submissions, then review one
     Review         - admin enters the good count (bad = total - good),
                      seller is credited good x price and notified
-    Give balance   - credit a seller's balance manually
+    Give balance   - credit one seller, or many at once from a pasted
+                     list / CSV file (`chat id | amount` per line,
+                     up to 500 lines)
     Master sheet   - totals per category + grand total
     Today's report - today's submissions, good/bad, paid total
     Export master  - the master sheet as a CSV file (admin only)
@@ -371,12 +376,12 @@ def _is_header_row(cells: list[str]) -> bool:
     return len(lowered) >= 2 and all(w in _HEADER_WORDS for w in lowered)
 
 
-def parse_account_line(line: str) -> dict | None:
-    """One account from a line: 'user | pass', 'user,pass', 'user:pass'
-    or 'user pass'. Returns None when the line has no usable pair."""
+def _split_account_cells(line: str) -> tuple[str, str | None]:
+    """First cell (column A / username) and second cell (password) of one
+    text line. Returns ("", None) for a blank line."""
     line = line.strip()
     if not line:
-        return None
+        return "", None
     if "," in line:
         try:
             parts = next(csv.reader([line]))
@@ -389,24 +394,64 @@ def parse_account_line(line: str) -> dict | None:
     else:
         parts = line.split()
     parts = [p.strip() for p in parts]
-    if len(parts) < 2 or not parts[0] or not parts[1]:
+    user = parts[0] if parts else ""
+    password = parts[1] if len(parts) > 1 and parts[1] else None
+    return user, password
+
+
+def parse_account_line(line: str) -> dict | None:
+    """One account from a line: 'user | pass', 'user,pass', 'user:pass'
+    or 'user pass'. Returns None when the line has no usable pair."""
+    user, password = _split_account_cells(line)
+    if not user or not password:
         return None
-    return {"user": parts[0], "pass": parts[1]}
+    return {"user": user, "pass": password}
+
+
+def _dedupe_accounts(rows: list[tuple[str, str | None]]) -> tuple[list[dict], dict]:
+    """Dedupe sheet rows (in sheet order) BY USERNAME (column A).
+
+    rows are (username, password-or-None). sheet_rows counts every row
+    with a non-empty username, row by row (1, 2, 3, ...). A username
+    appearing 2+ times — even with different passwords — is a
+    duplicate: only its FIRST occurrence is kept, the rest are dropped.
+    Returns (accounts, stats) with stats = {"sheet_rows": N,
+    "duplicates": [{"username": ..., "times": N}, ...]}.
+    """
+    accounts: list[dict] = []
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    sheet_rows = 0
+    for user, password in rows:
+        user = (user or "").strip()
+        if not user:
+            continue
+        sheet_rows += 1
+        if user not in counts:
+            counts[user] = 0
+            order.append(user)
+        counts[user] += 1
+        if counts[user] == 1 and password and password.strip():
+            accounts.append({"user": user, "pass": password.strip()})
+    duplicates = [{"username": u, "times": counts[u]} for u in order
+                  if counts[u] > 1]
+    return accounts, {"sheet_rows": sheet_rows, "duplicates": duplicates}
+
+
+def parse_accounts_report(text: str) -> tuple[list[dict], dict]:
+    """Accounts from plain text (CSV / TXT), with a serial row count and
+    duplicate usernames. See _dedupe_accounts for the counting rule."""
+    rows: list[tuple[str, str | None]] = []
+    for line in text.splitlines():
+        if _is_header_row([p.strip() for p in line.replace("|", ",").split(",")][:2]):
+            continue
+        rows.append(_split_account_cells(line))
+    return _dedupe_accounts(rows)
 
 
 def parse_accounts_text(text: str) -> list[dict]:
     """Accounts from plain text (CSV / TXT): one account per line."""
-    accounts: list[dict] = []
-    seen: set[tuple[str, str]] = set()
-    for line in text.splitlines():
-        if _is_header_row([p.strip() for p in line.replace("|", ",").split(",")][:2]):
-            continue
-        acc = parse_account_line(line)
-        if acc:
-            key = (acc["user"], acc["pass"])
-            if key not in seen:
-                seen.add(key)
-                accounts.append(acc)
+    accounts, _ = parse_accounts_report(text)
     return accounts
 
 
@@ -446,29 +491,34 @@ def parse_xlsx_rows(data: bytes) -> list[list[str]]:
     return rows
 
 
-def parse_accounts(data: bytes, filename: str = "") -> list[dict]:
-    """Accounts from an uploaded file: .xlsx (Google Sheets export),
-    .csv / .tsv / .txt. First column = user/email, second = password.
-    A header row is skipped; duplicate pairs are dropped."""
+def parse_accounts_report_file(data: bytes, filename: str = "") -> tuple[list[dict], dict]:
+    """Accounts + stats from an uploaded file: .xlsx (Google Sheets
+    export), .csv / .tsv / .txt. First column = user/email, second =
+    password. A header row is skipped; duplicates are by username
+    (see _dedupe_accounts)."""
     name = (filename or "").lower()
     if name.endswith(".xlsx") or data[:2] == b"PK":
-        accounts: list[dict] = []
-        seen: set[tuple[str, str]] = set()
+        rows: list[tuple[str, str | None]] = []
         for cells in parse_xlsx_rows(data):
-            if len(cells) < 2:
-                continue
             if _is_header_row(cells):
                 continue
-            user, password = cells[0].strip(), cells[1].strip()
-            if user and password and (user, password) not in seen:
-                seen.add((user, password))
-                accounts.append({"user": user, "pass": password})
-        return accounts
+            user = cells[0].strip() if cells else ""
+            password = cells[1].strip() if len(cells) > 1 and cells[1].strip() else None
+            rows.append((user, password))
+        return _dedupe_accounts(rows)
     try:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError:
         text = data.decode("latin-1")
-    return parse_accounts_text(text)
+    return parse_accounts_report(text)
+
+
+def parse_accounts(data: bytes, filename: str = "") -> list[dict]:
+    """Accounts from an uploaded file: .xlsx (Google Sheets export),
+    .csv / .tsv / .txt. First column = user/email, second = password.
+    A header row is skipped; duplicate usernames are dropped."""
+    accounts, _ = parse_accounts_report_file(data, filename)
+    return accounts
 
 
 def is_admin(chat_id: int, config: dict) -> bool:
@@ -527,11 +577,14 @@ def next_master_id(rows: list[dict]) -> int:
 
 
 def create_submission(seller_id: int, seller_name: str, seller_username: str,
-                      cat: dict, accounts: list[dict]) -> dict:
+                      cat: dict, accounts: list[dict],
+                      stats: dict | None = None) -> dict:
     """Save one pending submission and one master row per ID.
 
     Passwords are stored in master.json only — never in the submission
-    record and never in any chat message.
+    record and never in any chat message. stats (from
+    parse_accounts_report) stores the serial sheet-row count and the
+    duplicate usernames (usernames + times only, no passwords).
     """
     subs = load_submissions()
     master = load_master()
@@ -546,6 +599,8 @@ def create_submission(seller_id: int, seller_name: str, seller_username: str,
         "category_name": cat["name"],
         "price": int(cat["price"]),
         "total": len(accounts),
+        "sheet_rows": int(stats.get("sheet_rows", len(accounts))) if stats else len(accounts),
+        "duplicates": list(stats.get("duplicates", [])) if stats else [],
         "created_at": created,
         "date": created[:10],
         "status": "pending",
@@ -627,6 +682,118 @@ def give_balance_to(user_id: int, amount: int) -> int:
     if amount <= 0:
         raise ValueError("টাকার পরিমাণ ০-এর বেশি হতে হবে।")
     return add_balance(int(user_id), int(amount))
+
+
+BULK_GIVE_MAX_LINES = 500
+BULK_NOTIFY_MAX = 50
+BULK_HEADER_WORDS = {
+    "chat_id", "user_id", "userid", "username", "user", "id",
+    "amount", "টাকা", "পরিমাণ",
+}
+
+
+def bulk_credit(lines: list[str]) -> dict:
+    """Credit many sellers at once from `identifier | amount` lines.
+
+    identifier is a numeric Telegram chat id or an @username (resolved
+    from users who messaged the bot and from past submissions).
+    Amount must be a positive integer. At most BULK_GIVE_MAX_LINES
+    data lines are processed; the rest are counted as skipped.
+
+    Balances are loaded ONCE, all credits are applied in memory, and
+    the file is saved ONCE. Returns {"credited": [...], "failed": [...],
+    "total": int, "skipped": int, "processed": int}.
+    credited entries: {"chat_id", "name", "amount", "new_balance"}.
+    failed entries: {"line", "reason"} (identifiers + amounts only —
+    never any password).
+    """
+    state = load_state()
+    users = state.get("users", {})
+    by_username: dict[str, tuple[int, str]] = {}
+    for uid, u in users.items():
+        uname = (u.get("username") or "").strip().lower()
+        if uname and uname not in by_username:
+            name = (u.get("name") or "").strip()
+            by_username[uname] = (
+                int(uid),
+                f"{name} (@{u['username']})" if name else f"@{u['username']}",
+            )
+    for s in load_submissions():
+        uname = (s.get("seller_username") or "").strip().lower()
+        if uname and uname not in by_username:
+            by_username[uname] = (
+                int(s["seller_id"]),
+                (s.get("seller_name") or "").strip() + f" (@{s['seller_username']})",
+            )
+    balances = load_balances()
+    credited: list[dict] = []
+    failed: list[dict] = []
+    skipped = 0
+    processed = 0
+    for raw in lines:
+        line = (raw or "").strip()
+        if not line:
+            continue
+        if "|" in line:
+            parts = line.split("|")
+        elif "," in line:
+            parts = line.split(",")
+        else:
+            parts = line.split()
+        parts = [p.strip() for p in parts]
+        if len(parts) >= 2:
+            amount = parse_number(parts[1])
+            if amount is None and parts[0].lstrip("@").lower() in BULK_HEADER_WORDS:
+                continue  # header row (e.g. chat_id,amount) — skip silently
+        if processed >= BULK_GIVE_MAX_LINES:
+            skipped += 1
+            continue
+        processed += 1
+        if len(parts) < 2 or not parts[0]:
+            failed.append({
+                "line": line[:80],
+                "reason": "লাইনে আইডি আর টাকা — দুটোই লিখুন (যেমন: 123456 | 100)",
+            })
+            continue
+        identifier, amount_text = parts[0], parts[1]
+        amount = parse_number(amount_text)
+        if amount is None:
+            failed.append({"line": line[:80], "reason": "টাকার পরিমাণ সঠিক নয়"})
+            continue
+        if amount <= 0:
+            failed.append({"line": line[:80], "reason": "টাকার পরিমাণ ০-এর বেশি হতে হবে"})
+            continue
+        if identifier.lstrip("@").isdigit():
+            cid = int(identifier.lstrip("@"))
+            u = users.get(str(cid), {})
+            name = (u.get("name") or "").strip()
+            if u.get("username"):
+                name = f"{name} (@{u['username']})" if name else f"@{u['username']}"
+            display = name or str(cid)
+        else:
+            hit = by_username.get(identifier.lstrip("@").lower())
+            if not hit:
+                failed.append({
+                    "line": line[:80],
+                    "reason": f"@{identifier.lstrip('@')} ইউজারকে খুঁজে পাওয়া যায়নি",
+                })
+                continue
+            cid, display = hit
+        balances[str(cid)] = int(balances.get(str(cid), 0)) + amount
+        credited.append({
+            "chat_id": cid,
+            "name": display,
+            "amount": amount,
+            "new_balance": balances[str(cid)],
+        })
+    save_balances(balances)
+    return {
+        "credited": credited,
+        "failed": failed,
+        "total": sum(c["amount"] for c in credited),
+        "skipped": skipped,
+        "processed": processed,
+    }
 
 
 def seller_stats(seller_id: int) -> dict:
@@ -904,7 +1071,8 @@ def start_sell(chat_id: int, message_id: int | None, cat_id: int) -> None:
         send_message(chat_id, text)
 
 
-def finish_sell(chat_id: int, msg: dict, accounts: list[dict]) -> bool:
+def finish_sell(chat_id: int, msg: dict, accounts: list[dict],
+                stats: dict | None = None) -> bool:
     """Create the submission from parsed accounts. Returns True if saved."""
     state = load_state()
     flow = state.get("sell", {}).get(str(chat_id))
@@ -929,17 +1097,32 @@ def finish_sell(chat_id: int, msg: dict, accounts: list[dict]) -> bool:
     name = sender.get("first_name", "") or str(chat_id)
     if sender.get("last_name"):
         name += " " + sender["last_name"]
-    sub = create_submission(chat_id, name, sender.get("username", ""), cat, accounts)
+    sub = create_submission(chat_id, name, sender.get("username", ""), cat,
+                            accounts, stats)
     state.get("sell", {}).pop(str(chat_id), None)
     save_state(state)
+    sheet_rows = int((stats or {}).get("sheet_rows", len(accounts)))
+    dups = (stats or {}).get("duplicates") or []
+    lines = [
+        "✅ <b>জমা হয়েছে!</b>\n",
+        f"🧾 জমা নম্বর: <b>{sub['id']}</b>",
+        f"🆔 ক্যাটাগরি: {esc(cat['name'])}",
+        f"📦 মোট সারি: <b>{sheet_rows}টি</b>",
+        f"✅ নেওয়া হয়েছে: <b>{len(accounts)}টি</b>",
+    ]
+    if dups:
+        lines.append("⚠️ <b>ডুপ্লিকেট পাওয়া গেছে:</b>")
+        for d in dups:
+            lines.append(f"• {esc(d['username'])} — {d['times']} বার")
+    lines.append(f"💰 ভালো প্রতিটি আইডির দাম: {tk(cat['price'])}")
+    if sheet_rows <= 50:
+        names = "\n".join(f"{i + 1}. {esc(a['user'])}"
+                          for i, a in enumerate(accounts))
+        lines.append(f"\n<b>ইউজারনেমগুলো:</b>\n{names}")
+    lines.append("\n⏳ যাচাই চলছে — যাচাই শেষ হলে রিপোর্ট পাবেন।")
     send_message(
         chat_id,
-        f"✅ <b>জমা হয়েছে!</b>\n\n"
-        f"🧾 জমা নম্বর: <b>{sub['id']}</b>\n"
-        f"🆔 ক্যাটাগরি: {esc(cat['name'])}\n"
-        f"📦 আইডি: <b>{len(accounts)}টি</b>\n"
-        f"💰 ভালো প্রতিটি আইডির দাম: {tk(cat['price'])}\n\n"
-        f"⏳ যাচাই চলছে — যাচাই শেষ হলে রিপোর্ট পাবেন।",
+        "\n".join(lines),
         reply_keyboard_markup(load_config(), chat_id),
     )
     return True
@@ -1058,11 +1241,20 @@ def show_review_detail(chat_id: int, message_id: int | None, sub_id: str) -> Non
         "step": "review_good", "data": {"sub_id": sub_id},
     }
     save_state(state)
+    sheet_rows = int(sub.get("sheet_rows") or sub["total"])
+    dups = sub.get("duplicates") or []
+    dup_block = ""
+    if dups:
+        dup_lines = "\n".join(
+            f"• {esc(d['username'])} — {d['times']} বার" for d in dups)
+        dup_block = f"⚠️ <b>ডুপ্লিকেট:</b>\n{dup_lines}\n"
     text = (
         f"✅ <b>যাচাই করুন — {sub_id}</b>\n\n"
         f"👤 বিক্রেতা: {seller}\n"
         f"🆔 ক্যাটাগরি: {esc(sub['category_name'])} (প্রতি ভালো আইডি {tk(sub['price'])})\n"
-        f"📦 মোট আইডি: <b>{sub['total']}টি</b>\n"
+        f"📦 মোট সারি: <b>{sheet_rows}টি</b>\n"
+        f"✅ নেওয়া হয়েছে: <b>{sub['total']}টি</b>\n"
+        f"{dup_block}"
         f"🕐 জমা: {esc(sub.get('created_at', ''))}\n\n"
         f"<b>ইউজারনেমগুলো:</b>\n{name_block}\n"
         f"(🔒 পাসওয়ার্ড এখানে দেখানো হয় না)\n\n"
@@ -1132,6 +1324,26 @@ def show_today(chat_id: int, message_id: int | None = None) -> None:
 
 
 def start_give_balance(chat_id: int, message_id: int | None = None) -> None:
+    """Give-balance choice: one user (existing picker) or many at once."""
+    # A half-finished sell flow would eat a pasted bulk list as IDs,
+    # so entering this screen clears it (same as /cancel).
+    state = load_state()
+    state.get("sell", {}).pop(str(chat_id), None)
+    save_state(state)
+    kb = {"inline_keyboard": [
+        [{"text": "👤 একজনকে দিন", "callback_data": "adm:giveone"}],
+        [{"text": "👥 অনেকজনকে একসাথে দিন", "callback_data": "adm:givebulk"}],
+        [{"text": "⬅️ অ্যাডমিন প্যানেল", "callback_data": "admin"}],
+    ]}
+    text = "💰 <b>ব্যালেন্স দিন</b>\n\nএকজনকে দেবেন, নাকি অনেকজনকে একসাথে?"
+    if message_id:
+        edit_message(chat_id, message_id, text, kb)
+    else:
+        send_message(chat_id, text, kb)
+
+
+def show_give_balance_picker(chat_id: int, message_id: int | None = None) -> None:
+    """The single-user picker (the previous start_give_balance)."""
     state = load_state()
     users = dict(state.get("users", {}))
     balances = load_balances()
@@ -1157,6 +1369,63 @@ def start_give_balance(chat_id: int, message_id: int | None = None) -> None:
         edit_message(chat_id, message_id, text, {"inline_keyboard": rows})
     else:
         send_message(chat_id, text, {"inline_keyboard": rows})
+
+
+def finish_give_bulk(chat_id: int, text: str) -> None:
+    """Process a bulk give-balance list and report the result to admin."""
+    state = load_state()
+    state.get("admin", {}).pop(str(chat_id), None)
+    save_state(state)
+    result = bulk_credit(text.splitlines())
+    credited = result["credited"]
+    failed = result["failed"]
+    # Merge repeat lines per user for the notification + summary list.
+    recipients: dict[int, dict] = {}
+    for entry in credited:
+        cid = entry["chat_id"]
+        if cid in recipients:
+            recipients[cid]["amount"] += entry["amount"]
+            recipients[cid]["new_balance"] = entry["new_balance"]
+        else:
+            recipients[cid] = {"name": entry["name"], "amount": entry["amount"],
+                               "new_balance": entry["new_balance"]}
+    notified = False
+    if 0 < len(recipients) <= BULK_NOTIFY_MAX:
+        config = load_config()
+        for cid, info in recipients.items():
+            try:
+                send_message(
+                    cid,
+                    f"💰 <b>ব্যালেন্স পেয়েছেন!</b>\n\n"
+                    f"অ্যাডমিন আপনাকে <b>{tk(info['amount'])}</b> ব্যালেন্স দিয়েছেন।\n"
+                    f"💰 আপনার বর্তমান ব্যালেন্স: <b>{tk(info['new_balance'])}</b>",
+                    reply_keyboard_markup(config, cid),
+                )
+            except Exception:
+                pass  # one failed notification must not block the rest
+        notified = True
+    lines = ["👥 <b>বাল্ক ব্যালেন্স দেওয়া শেষ</b>\n"]
+    lines.append(f"✅ সফল: <b>{len(credited)}টি</b> লাইন, <b>{len(recipients)} জন</b> ইউজার")
+    lines.append(f"💰 মোট দেওয়া হয়েছে: <b>{tk(result['total'])}</b>")
+    if notified:
+        lines.append("📩 প্রত্যেককে মেসেজ পাঠানো হয়েছে।")
+    elif recipients:
+        lines.append(f"📵 {len(recipients)} জনকে আলাদা মেসেজ পাঠানো হয়নি "
+                     f"(৫০ জনের বেশি হলে মেসেজ পাঠানো হয় না)।")
+    if recipients and len(recipients) <= 20:
+        lines.append("\n<b>যাদের দেওয়া হয়েছে:</b>")
+        for info in recipients.values():
+            lines.append(f"• {esc(info['name'])} — {tk(info['amount'])}")
+    if failed:
+        lines.append(f"\n❌ হয়নি: <b>{len(failed)}টি</b> লাইন")
+        for f in failed[:30]:
+            lines.append(f"• {esc(f['line'])} — {f['reason']}")
+        if len(failed) > 30:
+            lines.append(f"…আরও {len(failed) - 30}টি লাইন ভুল আছে।")
+    if result["skipped"]:
+        lines.append(f"\n⏭️ পড়া হয়নি: <b>{result['skipped']}টি</b> লাইন "
+                     f"(একবারে সর্বোচ্চ {BULK_GIVE_MAX_LINES} লাইন)")
+    send_message(chat_id, "\n".join(lines), admin_menu())
 
 
 def handle_admin_text(chat_id: int, text: str, state: dict) -> bool:
@@ -1256,6 +1525,9 @@ def handle_admin_text(chat_id: int, text: str, state: dict) -> bool:
             kb,
         )
         return True
+    if step == "give_bulk":
+        finish_give_bulk(chat_id, text)
+        return True
     if step == "give_amount":
         amount = parse_number(text)
         if amount is None or amount <= 0:
@@ -1313,7 +1585,27 @@ def handle_message(msg: dict) -> None:
         return
 
     # A document (CSV / .xlsx) sent while selling: parse and submit.
+    # While the admin is in the bulk give-balance step, a CSV/TXT file
+    # is a bulk list instead.
     if "document" in msg:
+        admin_flow = state.get("admin", {}).get(str(chat_id))
+        if admin_flow and admin_flow.get("step") == "give_bulk":
+            doc = msg["document"]
+            fname = (doc.get("file_name", "") or "").lower()
+            if fname.endswith((".xlsx", ".xls")):
+                send_message(chat_id, "❌ Excel ফাইল নয় — <b>CSV / TXT</b> ফাইল পাঠান।")
+                return
+            try:
+                raw = download_file(doc["file_id"])
+                try:
+                    bulk_text = raw.decode("utf-8-sig")
+                except UnicodeDecodeError:
+                    bulk_text = raw.decode("latin-1")
+            except Exception as exc:
+                send_message(chat_id, f"😔 ফাইলটি পড়া যায়নি: {esc(str(exc))}\n\nআবার চেষ্টা করুন।")
+                return
+            finish_give_bulk(chat_id, bulk_text)
+            return
         flow = state.get("sell", {}).get(str(chat_id))
         if not flow:
             send_message(chat_id, "📤 আইডি জমা দিতে প্রথমে 📤 আইডি বিক্রি করুন বাটনে চাপ দিন।")
@@ -1321,11 +1613,11 @@ def handle_message(msg: dict) -> None:
         doc = msg["document"]
         try:
             data = download_file(doc["file_id"])
-            accounts = parse_accounts(data, doc.get("file_name", ""))
+            accounts, stats = parse_accounts_report_file(data, doc.get("file_name", ""))
         except Exception as exc:
             send_message(chat_id, f"😔 ফাইলটি পড়া যায়নি: {esc(str(exc))}\n\nআবার চেষ্টা করুন।")
             return
-        finish_sell(chat_id, msg, accounts)
+        finish_sell(chat_id, msg, accounts, stats)
         return
 
     # Persistent home-page buttons (reply keyboard): tapping one sends its
@@ -1408,8 +1700,8 @@ def handle_message(msg: dict) -> None:
 
     # Pasted text lines while selling: parse and submit.
     if state.get("sell", {}).get(str(chat_id)):
-        accounts = parse_accounts_text(text)
-        finish_sell(chat_id, msg, accounts)
+        accounts, stats = parse_accounts_report(text)
+        finish_sell(chat_id, msg, accounts, stats)
         return
 
     if handle_admin_text(chat_id, text, state):
@@ -1565,6 +1857,27 @@ def handle_callback(query: dict) -> None:
     elif data == "adm:givebalance":
         if admin_required(chat_id, config):
             start_give_balance(chat_id, message_id)
+    elif data == "adm:giveone":
+        if admin_required(chat_id, config):
+            show_give_balance_picker(chat_id, message_id)
+    elif data == "adm:givebulk":
+        if not admin_required(chat_id, config):
+            return
+        state.setdefault("admin", {})[str(chat_id)] = {
+            "step": "give_bulk", "data": {},
+        }
+        save_state(state)
+        edit_message(
+            chat_id, message_id,
+            "👥 <b>অনেকজনকে একসাথে ব্যালেন্স দিন</b>\n\n"
+            "প্রতি লাইনে একজন করে লিখুন:\n"
+            "<code>123456789 | 100</code>\n"
+            "অথবা ইউজারনেম দিয়ে:\n"
+            "<code>@rahim_sell | 100</code>\n\n"
+            "CSV / TXT ফাইলও পাঠাতে পারেন।\n"
+            "একবারে সর্বোচ্চ ৫০০ লাইন।\n\n"
+            "লিস্টটি পাঠান:",
+        )
     elif data.startswith("adm:givepick:"):
         if not admin_required(chat_id, config):
             return
